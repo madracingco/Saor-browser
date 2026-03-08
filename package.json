@@ -2,12 +2,15 @@
   "name": "saor-browser",
   "version": "0.1.0",
   "description": "Saor - A free and open-source browser built with web technologies",
-  "main": "src/main.ts",
+  "main": "dist/ui/app.js",
   "scripts": {
+    "start": "node --max-old-space-size=128 dist/ui/app.js",
+    "start:debug": "SAOR_DEBUG=1 node dist/ui/app.js",
+    "build": "tsc",
+    "build:run": "npm run build && npm run start",
     "test": "jest --coverage",
     "test:watch": "jest --watch",
     "test:ci": "jest --coverage --coverageReporters=text-summary --ci",
-    "build": "tsc",
     "lint": "eslint src/**/*.ts"
   },
   "jest": {
@@ -18,7 +21,8 @@
     "collectCoverageFrom": [
       "src/**/*.ts",
       "!src/**/*.d.ts",
-      "!src/main.ts"
+      "!src/main.ts",
+      "!src/ui/**/*.ts"
     ],
     "coverageThreshold": {
       "global": {
@@ -30,7 +34,9 @@
     },
     "coverageReporters": ["text", "lcov", "html"]
   },
-  "dependencies": {},
+  "dependencies": {
+    "@webview/webview": "^0.2.0"
+  },
   "devDependencies": {
     "@types/jest": "^29.5.0",
     "@types/node": "^20.0.0",
@@ -38,6 +44,9 @@
     "ts-jest": "^29.1.0",
     "typescript": "^5.0.0"
   },
-  "keywords": ["browser", "open-source", "privacy"],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["browser", "open-source", "privacy", "raspberry-pi", "lightweight"],
   "license": "GPL-3.0"
 }
