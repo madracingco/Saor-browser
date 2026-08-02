@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <util/atomic.h>
+#include <avr/wdt.h>
 
 /* ---------------------------------------------------------------------------
  * Single-cylinder CDI ignition controller
@@ -25,6 +26,25 @@ const float MIN_DELAY_ANGLE = 0.5;  // Never schedule closer than this to the se
 // Reject edges closer together than this (noise spikes above ~22,200 RPM).
 const unsigned long MIN_REV_DURATION_US = 2700UL;
 
+// Plausibility gate. The debounce above only catches spikes that land within
+// 2.7 ms of a genuine edge; ignition EMI arriving later than that would
+// otherwise be accepted as a real revolution. A single-cylinder engine cannot
+// come close to doubling its speed in one revolution, so an interval shorter
+// than half the previous one is noise. After this many consecutive rejections
+// we assume sync was genuinely lost rather than lock the spark out forever.
+const uint8_t MAX_CONSECUTIVE_REJECTS = 3;
+
+/* Fixed delay between the crank actually reaching SENSOR_ANGLE and this code
+ * capturing TCNT1: Hall output propagation delay plus AVR interrupt latency
+ * through attachInterrupt(). It is a constant time, so as an angle it grows
+ * with RPM (10 us is 0.07 deg at 1200 RPM but 0.66 deg at 11,000 RPM) and it
+ * always retards the spark.
+ *
+ * Left at 0 so the shipped behaviour is unchanged. To use it, take the output
+ * propagation delay from your Hall sensor's datasheet (typically 3-10 us) and
+ * add ~3 us of interrupt latency. Verify with a timing light afterwards. */
+const unsigned long TRIGGER_LATENCY_US = 0UL;
+
 // Below MIN_RPM the engine is not turning usefully. Withholding spark here also
 // avoids over-advanced firing during a slow kick, which is what causes kickback.
 const unsigned int MIN_RPM        = 100;
@@ -37,6 +57,24 @@ const unsigned long STALL_TIMEOUT_US = 1000000UL;
 // Timer1: /64 prescaler, free-running.
 const uint8_t       T1_PRESCALER_BITS = (1 << CS11) | (1 << CS10);
 const unsigned long US_PER_TICK       = 4UL;
+
+const unsigned long TRIGGER_LATENCY_TICKS =
+    (TRIGGER_LATENCY_US + (US_PER_TICK / 2)) / US_PER_TICK; // rounded to nearest tick
+
+/* Watchdog. loop() has no blocking calls, so it feeds the timer far more often
+ * than every 250 ms; only a genuine hang will time out. A reset costs a spark
+ * or two and a resync, which beats running the engine with no timing control.
+ *
+ * Some Nano bootloaders do not clear WDRF, which turns a single watchdog reset
+ * into a permanent reset loop. Clearing it in .init3 runs before main() and
+ * before anything can re-trigger it. */
+const uint8_t WDT_TIMEOUT = WDTO_250MS;
+
+void wdtDisableEarly(void) __attribute__((naked, used, section(".init3")));
+void wdtDisableEarly(void) {
+  MCUSR = 0;
+  wdt_disable();
+}
 
 // Ignition Map Structure
 struct TargetAdvance {
@@ -85,9 +123,11 @@ const uint32_t ANGLE_FP      = 64;  // fixed-point scale for the delay angle
 uint16_t delayAngleTable[2][RPM_BINS + 1];
 
 volatile unsigned long last_rev_time  = 0;
+volatile unsigned long last_interval  = 0;
 volatile unsigned int  latest_rpm     = 0;
 volatile bool          have_reference = false;
 volatile bool          rev_cut        = false;
+volatile uint8_t       noise_rejects  = 0;
 volatile uint8_t       active_curve   = 0;  // single byte: atomic against the ISR
 
 // Linear Interpolation Math Function
@@ -133,13 +173,26 @@ void sensorISR() {
   // interval measurement.
   if (interval < MIN_REV_DURATION_US) return;
 
+  // Plausibility gate for EMI landing outside the debounce window. Also
+  // rejected without committing the timestamp, so a spike cannot skew the
+  // next measurement either.
+  if (have_reference && last_interval != 0 && interval < (last_interval >> 1)) {
+    if (++noise_rejects < MAX_CONSECUTIVE_REJECTS) return;
+    have_reference = false;   // persistent mismatch: resync rather than lock out
+  }
+  noise_rejects = 0;
+
   last_rev_time = now;
 
-  // The first edge after boot or after a stall has no valid interval behind it.
+  // The first edge after boot, a stall, or a resync has no valid interval
+  // behind it.
   if (!have_reference) {
     have_reference = true;
+    last_interval = 0;
     return;
   }
+
+  last_interval = interval;
 
   unsigned int rpm = (unsigned int)(60000000UL / interval);
   latest_rpm = rpm;
@@ -171,8 +224,12 @@ void sensorISR() {
   unsigned long ticks = (angle_fp * interval) / (ANGLE_FP * 360UL * US_PER_TICK);
   if (ticks > 65000UL) ticks = 65000UL;
 
+  // Pull the spark forward to cancel the fixed trigger latency.
+  ticks = (ticks > TRIGGER_LATENCY_TICKS) ? ticks - TRIGGER_LATENCY_TICKS : 0;
+
   // Never schedule into the past: a compare target already passed would not
-  // match until the timer wrapped a full 262 ms later.
+  // match until the timer wrapped a full 262 ms later. Applied after the
+  // latency correction so it stays the final authority on the target.
   unsigned int elapsed = (unsigned int)(TCNT1 - t1_edge);
   if (ticks < (unsigned long)elapsed + 4UL) ticks = (unsigned long)elapsed + 4UL;
 
@@ -200,10 +257,14 @@ unsigned int readRpm() {
 }
 
 void setup() {
+  // Drive the SCR gate low before the pin becomes an output, so it cannot
+  // glitch high on the way. Note that the pin is high-Z during reset itself --
+  // an external pulldown on the gate is required, firmware cannot cover that.
+  PORTD &= ~(1 << PORTD4);
+  pinMode(SCR_PIN, OUTPUT);
+
   pinMode(SENSOR_PIN, INPUT_PULLUP);
   pinMode(MAP_SWITCH_PIN, INPUT_PULLUP); // Uses internal pullup resistor
-  pinMode(SCR_PIN, OUTPUT);
-  digitalWrite(SCR_PIN, LOW);
 
   buildDelayTable(0, curvePerformance);
   buildDelayTable(1, curveSafe);
@@ -215,9 +276,13 @@ void setup() {
   TIMSK1 = 0;
 
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, FALLING);
+
+  wdt_enable(WDT_TIMEOUT);
 }
 
 void loop() {
+  wdt_reset(); // fed only from loop(), so a hung main path still resets
+
   // Map switch is debounced out here rather than sampled inside the ISR, so a
   // bouncing contact cannot flip curves part-way through a revolution.
   static uint8_t last_raw = 0xFF;
@@ -241,6 +306,8 @@ void loop() {
       latest_rpm = 0;
       have_reference = false;
       rev_cut = false;
+      last_interval = 0;
+      noise_rejects = 0;
     }
   }
 }
