@@ -16,9 +16,27 @@
  * rather than added to the delay as extra retard.
  * ------------------------------------------------------------------------- */
 
-const byte SENSOR_PIN     = 2;   // Hall sensor on INT0
-const byte SCR_PIN        = 4;   // Output to SCR gate driver (PD4)
-const byte MAP_SWITCH_PIN = 7;   // Toggle switch (HIGH/open = Curve 1, LOW/closed = Curve 2)
+const byte SENSOR_PIN       = 2;  // Hall sensor on INT0
+const byte SCR_PIN          = 4;  // Gate driver input (PD4) -> UCC27517 -> pulse transformer
+const byte MAP_SWITCH_PIN   = 7;  // Toggle switch (HIGH/open = Curve 1, LOW/closed = Curve 2)
+const byte CHARGE_READY_PIN = 8;  // PB0, from LT3751 DONE (high = capacitor at target voltage)
+
+/* Gate pulse width. The SCR turns on in 1-2 us and self-commutates when the
+ * discharge falls below holding current, so this only has to comfortably clear
+ * turn-on. It is capped by the gate pulse transformer's volt-second product:
+ * 5 V x 10 us = 50 V.us, roughly half the rating of the specified part. Do not
+ * raise it without checking the transformer will not saturate. */
+const unsigned int GATE_PULSE_US = 10;
+
+/* Charge-ready interlock. The LT3751 asserts DONE once the discharge capacitor
+ * reaches its programmed voltage. If the charger has not finished by spark
+ * time, we fire anyway -- a weak spark beats a guaranteed misfire -- but count
+ * it, so an undersized charger shows up as a number instead of a vague
+ * complaint about the engine going soft at high revs.
+ *
+ * Set to 0 if the DONE line is not wired. The pin uses the internal pull-up so
+ * a disconnected input reads "ready" and stays quiet rather than counting noise. */
+#define USE_CHARGE_READY 1
 
 const float SENSOR_ANGLE    = 35.0; // Physical sensor position (degrees BTDC)
 const float MIN_DELAY_ANGLE = 0.5;  // Never schedule closer than this to the sensor edge
@@ -129,6 +147,7 @@ volatile bool          have_reference = false;
 volatile bool          rev_cut        = false;
 volatile uint8_t       noise_rejects  = 0;
 volatile uint8_t       active_curve   = 0;  // single byte: atomic against the ISR
+volatile unsigned int  weak_spark_count = 0;
 
 // Linear Interpolation Math Function
 float calculateAdvance(unsigned int current_rpm, const TargetAdvance* activeMap) {
@@ -240,32 +259,40 @@ void sensorISR() {
 
 /* Timer1 Match Interrupt: Executes precise spark discharge.
  *
- * The CDI power stage -- charger, discharge capacitor, SCR, gate driver and
- * coil -- is external and NOT specified by this firmware. Driving the gate
- * straight off a pin assumes the SCR cathode sits at MCU ground (low-side) and
- * that its I_GT fits an AVR pin's budget through a gate resistor. A high-side
- * SCR needs a pulse transformer or opto-isolated driver instead, and will
- * simply never fire from this code. See README "CDI power stage".
- *
- * 25 us is generous: SCR turn-on delay is typically 1-2 us and the device
- * self-commutates when the discharge falls below holding current. There is no
- * charge-ready interlock -- this fires on schedule whether or not the capacitor
- * actually reached voltage. */
+ * PD4 drives the gate driver input, not the SCR gate itself -- the gate is fed
+ * through a pulse transformer, so the MCU is galvanically clear of the 400 V
+ * stage and the SCR does not have to be a low-side, sensitive-gate part.
+ * See README "CDI power stage" for the specified chain. */
 ISR(TIMER1_COMPA_vect) {
   TIMSK1 &= ~(1 << OCIE1A);   // Turn off self until next cycle
 
-  PORTD |= (1 << PORTD4);     // Pull SCR Gate High (Pin 4)
-  delayMicroseconds(25);      // Saturate SCR gate trigger window
-  PORTD &= ~(1 << PORTD4);    // Pull SCR Gate Low
+#if USE_CHARGE_READY
+  // Fire regardless, but record that this one went out under-charged.
+  if (!(PINB & (1 << PINB0))) weak_spark_count++;
+#endif
+
+  PORTD |= (1 << PORTD4);            // Gate driver input high
+  delayMicroseconds(GATE_PULSE_US);  // Clear the SCR's turn-on delay
+  PORTD &= ~(1 << PORTD4);           // Gate driver input low
 }
 
-// Safe accessor for external dashboards / shift lights.
+// Safe accessors for external dashboards / shift lights.
 unsigned int readRpm() {
   unsigned int r;
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     r = latest_rpm;
   }
   return r;
+}
+
+// Sparks fired before the capacitor reached voltage. A number that climbs with
+// revs means the charger is undersized for the rate being asked of it.
+unsigned int readWeakSparks() {
+  unsigned int w;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    w = weak_spark_count;
+  }
+  return w;
 }
 
 void setup() {
@@ -277,6 +304,9 @@ void setup() {
 
   pinMode(SENSOR_PIN, INPUT_PULLUP);
   pinMode(MAP_SWITCH_PIN, INPUT_PULLUP); // Uses internal pullup resistor
+#if USE_CHARGE_READY
+  pinMode(CHARGE_READY_PIN, INPUT_PULLUP); // unwired reads "ready", stays quiet
+#endif
 
   buildDelayTable(0, curvePerformance);
   buildDelayTable(1, curveSafe);

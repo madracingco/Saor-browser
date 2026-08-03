@@ -11,8 +11,9 @@ current RPM, and schedules the SCR gate pulse `(SENSOR_ANGLE - advance)` degrees
 | Pin | Signal | Notes |
 |---|---|---|
 | D2 | Hall sensor | INT0, falling edge. **Add an external 1k–4.7k pull-up to 5V** |
-| D4 | SCR gate driver | PD4, 25 µs active-high pulse. **Add an external 1k pulldown to GND** |
+| D4 | Gate driver input | PD4, 10 µs active-high into UCC27517. **Add an external 1k pulldown to GND** |
 | D7 | Map select switch | Internal pull-up. Open = Curve 1, closed to ground = Curve 2 |
+| D8 | Charge ready | PB0, from LT3751 `DONE`. Internal pull-up; unwired reads "ready" |
 
 ### Required external parts
 
@@ -22,9 +23,9 @@ These two resistors are not optional:
   internal pull-up is 20–50 kΩ, which against a metre of cable capacitance gives
   a multi-microsecond rise time — slow edges next to an HT lead invite double
   triggering.
-- **D4 pulldown (1k to GND).** All AVR pins are high-Z during reset, so the SCR
-  gate floats and can self-trigger on ignition noise. Firmware cannot cover this
-  window; only the resistor can.
+- **D4 pulldown (1k to GND).** All AVR pins are high-Z during reset, so the gate
+  driver input floats and can self-trigger on ignition noise. Firmware cannot
+  cover this window; only the resistor can.
 
 Use a **non-latching (unipolar) Hall** with a single magnet. A latching type
 (US1881) needs alternating N/S poles — with one magnet it latches on and never
@@ -54,77 +55,88 @@ request advance at or beyond it — `buildDelayTable()` caps anything that does.
 
 ## CDI power stage
 
-**Not specified in this firmware.** The sketch controls only *when* the spark
-fires; the DC-CDI charger, discharge capacitor, SCR, gate driver and coil are
-external and are not described anywhere in this repository. The values below are
-the constraints the firmware imposes on them, not a specification of any
-particular build. Fill in the TBD column for your hardware.
+Specified for a **400 V rail into 1 µF — 80 mJ per spark**, sustained to the
+11,000 RPM limiter. The two decisions that drive everything else are that rail
+energy and the choice to drive the SCR through an **isolated gate transformer**
+rather than straight off a pin.
 
-| Block | Firmware requirement | Part |
+| Block | Part | Key spec |
 |---|---|---|
-| DC-CDI charger | Must fully recharge between sparks — see budget below | TBD |
-| Discharge capacitor | Sets spark energy; ring time must suit the coil | TBD |
-| SCR | Gate must latch from a 5 V, 25 µs pulse | TBD |
-| Gate driver | See drive assumptions below | TBD |
-| Ignition coil | Must be rated for capacitive discharge | TBD |
+| Charger controller | **ADI LT3751** | Flyback capacitor charger, programmable to 500 V, `DONE` output |
+| Flyback transformer | 1:10, ≥20 W pulse rating | Per LT3751 datasheet table (Würth / Coilcraft matched parts) |
+| Primary switch | 150–200 V logic-level N-MOSFET | e.g. IRFB4615 — sees V<sub>in</sub> + V<sub>out</sub>/N ≈ 52 V plus leakage |
+| HV rectifier | **MUR1100E** | 1000 V, 1 A ultrafast |
+| Discharge capacitor | **1.0 µF / 630 VDC polypropylene pulse** | WIMA MKP10 or EPCOS B32656S — dV/dt ≥ 50 V/µs, I<sub>pk</sub> ≥ 60 A |
+| SCR | **ST TYN1225RG** | 25 A, 1200 V, I<sub>TSM</sub> 250 A, TO-220AB |
+| Gate driver | **TI UCC27517** + 1:1 pulse transformer | 4 A peak, 5 V logic input; isolates MCU from the 400 V stage |
+| Coil | **MSD 8223 Blaster HVC** | CD-rated, ~0.7 Ω primary |
 
-### What the firmware assumes about the gate drive
+Verify orderable part numbers against current stock — families are stable but
+specific suffixes are not, and the capacitor in particular should be checked for
+its dV/dt rating rather than voltage alone.
 
-`ISR(TIMER1_COMPA_vect)` drives D4 directly with `PORTD |= (1 << PORTD4)`. That
-encodes three assumptions that the power stage must satisfy:
+### Why isolated gate drive
 
-1. **The SCR cathode sits at MCU ground** (low-side switching). If the SCR is
-   high-side — cathode at the coil primary rather than ground — direct pin drive
-   cannot work and the gate needs a pulse transformer or an opto-isolated driver.
-   Nothing in the firmware detects or tolerates this; it simply will not fire.
-2. **The SCR is a sensitive-gate type** whose I<sub>GT</sub> fits inside an AVR
-   pin's budget (20 mA recommended, 40 mA absolute). Size the gate resistor for
-   the datasheet I<sub>GT</sub> — roughly (5 V − V<sub>GT</sub>) / I<sub>GT</sub>,
-   e.g. ~390 Ω for 10 mA.
-3. **25 µs is longer than the SCR needs.** Turn-on delay is typically 1–2 µs, and
-   once the discharge current exceeds the latching current the gate no longer
-   matters — the SCR self-commutates when the current falls below holding
-   current. The width is generous on purpose; it can be reduced to 5–10 µs if you
-   want the ISR to block for less time.
+Driving the SCR gate directly from PD4 would have forced two constraints: the
+SCR cathode must sit at MCU ground (low-side only), and the device must be a
+sensitive-gate type whose I<sub>GT</sub> fits an AVR pin's ~20 mA budget. Those
+rule out any SCR with a serious dI/dt rating, which is the parameter that
+actually matters when 57 A appears in 11 µs.
 
-### Recharge budget
+The UCC27517 into a 1:1 pulse transformer removes both constraints, delivers a
+fast, hard gate pulse, and keeps the MCU galvanically clear of the 400 V stage —
+the single biggest reliability risk in a system this electrically noisy.
 
-One spark per revolution, so at the 11,000 RPM limiter the charger has **5.45 ms**
-between sparks (9.23 ms at 6,500 RPM). Continuous charging power is
-E = ½CV² × sparks/second, which at the limiter (183.3 sparks/s) works out as:
+**This is why `GATE_PULSE_US` is 10, not 25.** The pulse transformer's
+volt-second product is the binding limit: 5 V × 10 µs = 50 V·µs, roughly half the
+specified part's rating. The SCR itself only needs 1–2 µs to turn on and then
+self-commutates below holding current, so 10 µs is already generous. **Raising it
+saturates the transformer.**
 
-| Capacitor | Voltage | Energy/spark | Charger power at 11,000 RPM |
-|---|---|---|---|
-| 0.47 µF | 400 V | 37.6 mJ | 6.9 W |
-| 1.0 µF | 300 V | 45.0 mJ | 8.3 W |
-| 2.2 µF | 250 V | 68.8 mJ | 12.6 W |
+### Energy and recharge budget
 
-At ~80% inverter efficiency that is **0.9–1.6 A drawn from a 12 V pack**, on top
-of the Nano — size the battery wiring and any shared buck converter accordingly.
-A charger that cannot keep up does not fail loudly; spark energy just fades as
-revs rise.
+| Quantity | Value |
+|---|---|
+| Energy per spark | ½CV² = **80 mJ** |
+| Sparks/second at limiter | 11,000 / 60 = **183.3** |
+| Charger output power | **14.7 W** |
+| Draw from 12 V at ~80% efficiency | **≈ 1.5 A** |
+| Time available between sparks | **5.45 ms** at 11,000 RPM, 9.23 ms at 6,500 |
+| Peak primary current | V·√(C/L) = **≈ 57 A** |
+| Discharge rise time | (π/2)·√(LC) = **≈ 11 µs** |
+| Secondary output | 400 V × ~100:1 ≈ **40 kV** |
 
-> **There is no charge-ready interlock.** The firmware fires on schedule
-> regardless of whether the capacitor actually reached voltage. If you want the
-> controller to know, that needs a comparator on the cap divider into a spare
-> pin — it is not implemented.
+That 1.5 A is on top of the Nano and is the dominant load — size the pack wiring,
+fusing and the buck converter for it.
 
-### Coil selection
+### Charge-ready interlock
 
-The capacitor and the coil's **primary inductance** form the discharge tank, so
-the coil must be a capacitive-discharge type. Many coils — including much of the
-inductive/Kettering range — have a primary inductance one to two orders of
-magnitude too high, which stretches the rise time and collapses peak current:
+The LT3751's `DONE` output goes to **D8**, which is why this part was chosen over
+a generic UC3845 flyback: the interlock comes free with the controller.
 
-| Primary inductance | Rise time (1 µF) | Peak primary current at 300 V |
+The firmware **fires regardless** of `DONE` — a weak spark beats a guaranteed
+misfire — but counts under-charged sparks, readable via `readWeakSparks()`. A
+count that climbs with revs means the charger is not keeping up with the rate
+being asked of it. Set `USE_CHARGE_READY` to 0 if the line is not wired; the pin
+uses the internal pull-up, so a disconnected input reads "ready" and stays quiet.
+
+### Why this coil
+
+Capacitor and coil **primary inductance** form the discharge tank, so the coil
+must be a capacitive-discharge type. Much of the inductive/Kettering range has a
+primary inductance one to two orders of magnitude too high, which stretches rise
+time and collapses peak current:
+
+| Primary inductance | Rise time (1 µF) | Peak primary current at 400 V |
 |---|---|---|
-| 50 µH (CDI type) | ~11 µs | ~42 A |
-| 5 mH (inductive type) | ~111 µs | ~4.2 A |
+| 50 µH (CD type) | ~11 µs | ~57 A |
+| 5 mH (inductive type) | ~111 µs | ~5.7 A |
 
-Rise time is (π/2)·√(LC); peak current is V·√(C/L). Confirm against the coil
-manufacturer's own CDI compatibility statement rather than inferring it from the
-brand — a coil sold for a capacitive box is not the same as one sold for a points
-or transistorised system.
+The 8223 is a CD-rated coil, and 400 V against its turns ratio lands at roughly
+the 40 kV MSD claims for it — a useful consistency check that the rail voltage
+and coil are matched. Confirm primary inductance against the tank figures above;
+a coil sold for a capacitive box is not the same as one sold for a points or
+transistorised system, whatever the brand on it.
 
 ## Curves
 
