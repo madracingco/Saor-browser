@@ -238,7 +238,19 @@ void sensorISR() {
   TIMSK1 |= (1 << OCIE1A);    // arm compare match
 }
 
-// Timer1 Match Interrupt: Executes precise spark discharge
+/* Timer1 Match Interrupt: Executes precise spark discharge.
+ *
+ * The CDI power stage -- charger, discharge capacitor, SCR, gate driver and
+ * coil -- is external and NOT specified by this firmware. Driving the gate
+ * straight off a pin assumes the SCR cathode sits at MCU ground (low-side) and
+ * that its I_GT fits an AVR pin's budget through a gate resistor. A high-side
+ * SCR needs a pulse transformer or opto-isolated driver instead, and will
+ * simply never fire from this code. See README "CDI power stage".
+ *
+ * 25 us is generous: SCR turn-on delay is typically 1-2 us and the device
+ * self-commutates when the discharge falls below holding current. There is no
+ * charge-ready interlock -- this fires on schedule whether or not the capacitor
+ * actually reached voltage. */
 ISR(TIMER1_COMPA_vect) {
   TIMSK1 &= ~(1 << OCIE1A);   // Turn off self until next cycle
 

@@ -52,6 +52,80 @@ Also recommended for a battery-fed ignition system:
 BTDC. The spark can only ever be scheduled *after* this point, so no map may
 request advance at or beyond it — `buildDelayTable()` caps anything that does.
 
+## CDI power stage
+
+**Not specified in this firmware.** The sketch controls only *when* the spark
+fires; the DC-CDI charger, discharge capacitor, SCR, gate driver and coil are
+external and are not described anywhere in this repository. The values below are
+the constraints the firmware imposes on them, not a specification of any
+particular build. Fill in the TBD column for your hardware.
+
+| Block | Firmware requirement | Part |
+|---|---|---|
+| DC-CDI charger | Must fully recharge between sparks — see budget below | TBD |
+| Discharge capacitor | Sets spark energy; ring time must suit the coil | TBD |
+| SCR | Gate must latch from a 5 V, 25 µs pulse | TBD |
+| Gate driver | See drive assumptions below | TBD |
+| Ignition coil | Must be rated for capacitive discharge | TBD |
+
+### What the firmware assumes about the gate drive
+
+`ISR(TIMER1_COMPA_vect)` drives D4 directly with `PORTD |= (1 << PORTD4)`. That
+encodes three assumptions that the power stage must satisfy:
+
+1. **The SCR cathode sits at MCU ground** (low-side switching). If the SCR is
+   high-side — cathode at the coil primary rather than ground — direct pin drive
+   cannot work and the gate needs a pulse transformer or an opto-isolated driver.
+   Nothing in the firmware detects or tolerates this; it simply will not fire.
+2. **The SCR is a sensitive-gate type** whose I<sub>GT</sub> fits inside an AVR
+   pin's budget (20 mA recommended, 40 mA absolute). Size the gate resistor for
+   the datasheet I<sub>GT</sub> — roughly (5 V − V<sub>GT</sub>) / I<sub>GT</sub>,
+   e.g. ~390 Ω for 10 mA.
+3. **25 µs is longer than the SCR needs.** Turn-on delay is typically 1–2 µs, and
+   once the discharge current exceeds the latching current the gate no longer
+   matters — the SCR self-commutates when the current falls below holding
+   current. The width is generous on purpose; it can be reduced to 5–10 µs if you
+   want the ISR to block for less time.
+
+### Recharge budget
+
+One spark per revolution, so at the 11,000 RPM limiter the charger has **5.45 ms**
+between sparks (9.23 ms at 6,500 RPM). Continuous charging power is
+E = ½CV² × sparks/second, which at the limiter (183.3 sparks/s) works out as:
+
+| Capacitor | Voltage | Energy/spark | Charger power at 11,000 RPM |
+|---|---|---|---|
+| 0.47 µF | 400 V | 37.6 mJ | 6.9 W |
+| 1.0 µF | 300 V | 45.0 mJ | 8.3 W |
+| 2.2 µF | 250 V | 68.8 mJ | 12.6 W |
+
+At ~80% inverter efficiency that is **0.9–1.6 A drawn from a 12 V pack**, on top
+of the Nano — size the battery wiring and any shared buck converter accordingly.
+A charger that cannot keep up does not fail loudly; spark energy just fades as
+revs rise.
+
+> **There is no charge-ready interlock.** The firmware fires on schedule
+> regardless of whether the capacitor actually reached voltage. If you want the
+> controller to know, that needs a comparator on the cap divider into a spare
+> pin — it is not implemented.
+
+### Coil selection
+
+The capacitor and the coil's **primary inductance** form the discharge tank, so
+the coil must be a capacitive-discharge type. Many coils — including much of the
+inductive/Kettering range — have a primary inductance one to two orders of
+magnitude too high, which stretches the rise time and collapses peak current:
+
+| Primary inductance | Rise time (1 µF) | Peak primary current at 300 V |
+|---|---|---|
+| 50 µH (CDI type) | ~11 µs | ~42 A |
+| 5 mH (inductive type) | ~111 µs | ~4.2 A |
+
+Rise time is (π/2)·√(LC); peak current is V·√(C/L). Confirm against the coil
+manufacturer's own CDI compatibility statement rather than inferring it from the
+brand — a coil sold for a capacitive box is not the same as one sold for a points
+or transistorised system.
+
 ## Curves
 
 | | Curve 1 (D7 open) | Curve 2 (D7 grounded) |
