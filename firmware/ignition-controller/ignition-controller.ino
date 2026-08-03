@@ -55,13 +55,14 @@ const uint8_t MAX_CONSECUTIVE_REJECTS = 3;
 /* Fixed delay between the crank actually reaching SENSOR_ANGLE and this code
  * capturing TCNT1: Hall output propagation delay plus AVR interrupt latency
  * through attachInterrupt(). It is a constant time, so as an angle it grows
- * with RPM (10 us is 0.07 deg at 1200 RPM but 0.66 deg at 11,000 RPM) and it
- * always retards the spark.
+ * with RPM (0.06 deg at 1200 RPM, 0.53 deg at 11,000) and always retards.
  *
- * Left at 0 so the shipped behaviour is unchanged. To use it, take the output
- * propagation delay from your Hall sensor's datasheet (typically 3-10 us) and
- * add ~3 us of interrupt latency. Verify with a timing light afterwards. */
-const unsigned long TRIGGER_LATENCY_US = 0UL;
+ * 8 us = ~5 us for the specified Allegro A1101 unipolar switch, plus ~3 us of
+ * AVR interrupt latency through the attachInterrupt() prologue. Both terms are
+ * definitely non-zero, so 8 is a far better estimate than leaving this at 0.
+ * Trim it against a timing light during commissioning if you want the last
+ * tenth of a degree at the top end. */
+const unsigned long TRIGGER_LATENCY_US = 8UL;
 
 // Below MIN_RPM the engine is not turning usefully. Withholding spark here also
 // avoids over-advanced firing during a slow kick, which is what causes kickback.

@@ -27,9 +27,11 @@ These two resistors are not optional:
   driver input floats and can self-trigger on ignition noise. Firmware cannot
   cover this window; only the resistor can.
 
-Use a **non-latching (unipolar) Hall** with a single magnet. A latching type
-(US1881) needs alternating N/S poles — with one magnet it latches on and never
-produces a second edge.
+The specified **Allegro A1101LUA** is a unipolar (non-latching) switch, so a
+single magnet gives one clean edge per revolution, and its −40 to +150 °C range
+suits an engine bay. Do not substitute a latching type such as the US1881 — that
+needs alternating N/S poles, and with one magnet it latches on and never produces
+a second edge, which presents as an engine that simply will not run.
 
 ### Power
 
@@ -55,7 +57,7 @@ request advance at or beyond it — `buildDelayTable()` caps anything that does.
 
 ## CDI power stage
 
-Specified for a **400 V rail into 1 µF — 80 mJ per spark**, sustained to the
+Specified for a **400 V rail into 1.1 µF — 88 mJ per spark**, sustained to the
 11,000 RPM limiter. The two decisions that drive everything else are that rail
 energy and the choice to drive the SCR through an **isolated gate transformer**
 rather than straight off a pin.
@@ -66,14 +68,31 @@ rather than straight off a pin.
 | Flyback transformer | 1:10, ≥20 W pulse rating | Per LT3751 datasheet table (Würth / Coilcraft matched parts) |
 | Primary switch | 150–200 V logic-level N-MOSFET | e.g. IRFB4615 — sees V<sub>in</sub> + V<sub>out</sub>/N ≈ 52 V plus leakage |
 | HV rectifier | **MUR1100E** | 1000 V, 1 A ultrafast |
-| Discharge capacitor | **1.0 µF / 630 VDC polypropylene pulse** | WIMA MKP10 or EPCOS B32656S — dV/dt ≥ 50 V/µs, I<sub>pk</sub> ≥ 60 A |
+| Discharge capacitor | **5 × 0.22 µF / 1000 VDC MKP, paralleled** = 1.1 µF | WIMA MKP10 0.22 µF/1000 V — see below |
 | SCR | **ST TYN1225RG** | 25 A, 1200 V, I<sub>TSM</sub> 250 A, TO-220AB |
 | Gate driver | **TI UCC27517** + 1:1 pulse transformer | 4 A peak, 5 V logic input; isolates MCU from the 400 V stage |
-| Coil | **MSD 8223 Blaster HVC** | CD-rated, ~0.7 Ω primary |
+| Coil | **MSD 8223 Blaster HVC** | 0.7 Ω primary, specified by MSD for CD ignition systems |
+| Hall sensor | **Allegro A1101LUA** | Unipolar (non-latching) switch, open-drain, −40 to +150 °C |
 
-Verify orderable part numbers against current stock — families are stable but
-specific suffixes are not, and the capacitor in particular should be checked for
-its dV/dt rating rather than voltage alone.
+### Why five capacitors instead of one
+
+The discharge is an LC ring, so peak dV/dt is V·ω, **not** V divided by rise time —
+the crude figure understates it by π/2:
+
+```
+ω = 1/√(LC) = 1.35e5 rad/s      dV/dt = 400 × ω = 53.9 V/µs
+```
+
+A capacitor's dV/dt rating is really a peak-current rating in disguise
+(I = C·dV/dt), and the limit is current through the end-spray and electrode
+contacts. A single 1 µF part would have to carry the full **57 A**, which sits
+right at the edge of what a 1 µF MKP part will do. Five 0.22 µF parts see the
+same 54 V/µs but split the current **11.9 A each**, well inside the rating of
+small-value MKP — and paralleling drops ESL about fivefold, which sharpens the
+rise as a bonus. 1000 V parts on a 400 V rail is 2.5× derating.
+
+Mount them as a tight cluster with short, wide copper to the SCR and coil; the
+loop area of the discharge path matters more than any single component here.
 
 ### Why isolated gate drive
 
@@ -81,7 +100,7 @@ Driving the SCR gate directly from PD4 would have forced two constraints: the
 SCR cathode must sit at MCU ground (low-side only), and the device must be a
 sensitive-gate type whose I<sub>GT</sub> fits an AVR pin's ~20 mA budget. Those
 rule out any SCR with a serious dI/dt rating, which is the parameter that
-actually matters when 57 A appears in 11 µs.
+actually matters when 59 A appears in under 12 µs.
 
 The UCC27517 into a 1:1 pulse transformer removes both constraints, delivers a
 fast, hard gate pulse, and keeps the MCU galvanically clear of the 400 V stage —
@@ -97,17 +116,20 @@ saturates the transformer.**
 
 | Quantity | Value |
 |---|---|
-| Energy per spark | ½CV² = **80 mJ** |
+| Energy per spark | ½CV² = **88 mJ** |
 | Sparks/second at limiter | 11,000 / 60 = **183.3** |
-| Charger output power | **14.7 W** |
-| Draw from 12 V at ~80% efficiency | **≈ 1.5 A** |
+| Charger output power | **16.1 W** |
+| Draw from 12 V at ~80% efficiency | **≈ 1.7 A** |
 | Time available between sparks | **5.45 ms** at 11,000 RPM, 9.23 ms at 6,500 |
-| Peak primary current | V·√(C/L) = **≈ 57 A** |
-| Discharge rise time | (π/2)·√(LC) = **≈ 11 µs** |
+| Peak primary current | V·√(C/L) = **≈ 59 A** (11.9 A per capacitor) |
+| Peak dV/dt | V/√(LC) = **≈ 54 V/µs** |
+| Discharge rise time | (π/2)·√(LC) = **≈ 11.7 µs** |
 | Secondary output | 400 V × ~100:1 ≈ **40 kV** |
 
-That 1.5 A is on top of the Nano and is the dominant load — size the pack wiring,
-fusing and the buck converter for it.
+That 1.7 A is on top of the Nano and is the dominant load — size the pack wiring,
+fusing and the buck converter for it. Discharge takes ~12 µs against 5.45 ms
+between sparks at the limiter, a ~460× margin, so the ring is over long before
+the next revolution regardless of coil tolerance.
 
 ### Charge-ready interlock
 
@@ -127,16 +149,23 @@ must be a capacitive-discharge type. Much of the inductive/Kettering range has a
 primary inductance one to two orders of magnitude too high, which stretches rise
 time and collapses peak current:
 
-| Primary inductance | Rise time (1 µF) | Peak primary current at 400 V |
+| Primary inductance | Rise time (1.1 µF) | Peak primary current at 400 V |
 |---|---|---|
-| 50 µH (CD type) | ~11 µs | ~57 A |
-| 5 mH (inductive type) | ~111 µs | ~5.7 A |
+| 50 µH (CD type) | ~12 µs | ~59 A |
+| 5 mH (inductive type) | ~117 µs | ~5.9 A |
 
-The 8223 is a CD-rated coil, and 400 V against its turns ratio lands at roughly
-the 40 kV MSD claims for it — a useful consistency check that the rail voltage
-and coil are matched. Confirm primary inductance against the tank figures above;
-a coil sold for a capacitive box is not the same as one sold for a points or
-transistorised system, whatever the brand on it.
+MSD specifies the Blaster HVC for its 6-series capacitive-discharge boxes and
+publishes a 0.7 Ω primary and ~40 kV output — 400 V against that output implies
+roughly a 100:1 turns ratio, so rail and coil are matched.
+
+Primary inductance is not a published figure for any ignition coil, and it does
+not need to be for this controller: the firmware sets *when* the spark fires, not
+the discharge dynamics. A coil at the far end of tolerance shifts rise time and
+peak current but the spark still lands at the commanded crank angle, and even a
+10× inductance error leaves the ring finishing ~45× inside one revolution. The
+binding requirement is simply that the coil is manufacturer-stated for capacitive
+discharge — a coil sold for a points or transistorised system is not, whatever
+the brand on it.
 
 ## Curves
 
@@ -166,19 +195,20 @@ spark out indefinitely.
 
 ## Trigger latency compensation
 
-`TRIGGER_LATENCY_US` (default **0**) is subtracted from the scheduled delay to
-cancel Hall propagation delay plus AVR interrupt latency. This is a fixed
-*time*, so as an *angle* it grows with RPM and always retards the spark:
+`TRIGGER_LATENCY_US` is set to **8** — about 5 µs of propagation delay for the
+specified A1101 plus ~3 µs of AVR interrupt latency through the
+`attachInterrupt()` prologue. It is subtracted from the scheduled delay. Being a
+fixed *time*, as an *angle* it grows with RPM and always retards the spark:
 
-| RPM | 10 µs of latency |
+| RPM | 8 µs of latency |
 |---|---|
-| 1,200 | 0.07° |
-| 6,500 | 0.39° |
-| 11,000 | 0.66° |
+| 1,200 | 0.06° |
+| 6,500 | 0.31° |
+| 11,000 | 0.53° |
 
-To use it, take the output propagation delay from your Hall sensor's datasheet
-(typically 3–10 µs), add ~3 µs of interrupt latency, and verify with a timing
-light afterwards.
+Both terms are definitely non-zero, so 8 µs is a much better estimate than zero.
+Trim it against the timing light during commissioning if you want the last tenth
+of a degree at the top end.
 
 ## Timing implementation
 
@@ -212,5 +242,21 @@ avr-g++ -mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu++11 -Wall -Wextra \
   -x c++ ignition-controller.ino -c -o /tmp/out.o
 ```
 
-> **Safety:** this drives a live ignition system. Verify the fired angle with a
-> timing light against a degree wheel before running the engine under load.
+## Commissioning
+
+Every ignition build gets timed on the engine it runs on — `SENSOR_ANGLE` is a
+physical measurement of your trigger position, and no firmware can verify it.
+
+1. Confirm the magnet passes the A1101 with the specified air gap and that D2
+   gives one clean falling edge per revolution.
+2. Crank with the plug grounded and confirm spark.
+3. **Put a timing light on it against a degree wheel** and check the fired angle
+   matches the curve at idle and at a mid-range hold. If it reads consistently
+   retarded at high RPM, raise `TRIGGER_LATENCY_US`.
+4. Read `readWeakSparks()` after a full-throttle run. Any climb with revs means
+   the charger is not keeping up.
+
+> **This drives a live ignition system at 400 V and ~40 kV.** Discharge the
+> capacitor bank before touching the power stage — 88 mJ at 400 V is enough to
+> hurt, and the bank holds charge after the pack is disconnected. Bleed resistor
+> across the bank is cheap insurance.
