@@ -10,10 +10,12 @@ current RPM, and schedules the SCR gate pulse `(SENSOR_ANGLE - advance)` degrees
 
 | Pin | Signal | Notes |
 |---|---|---|
-| D2 | Hall sensor | INT0, falling edge. **Add an external 1k–4.7k pull-up to 5V** |
-| D4 | Gate driver input | PD4, 10 µs active-high into UCC27517. **Add an external 1k pulldown to GND** |
-| D7 | Map select switch | Internal pull-up. Open = Curve 1, closed to ground = Curve 2 |
-| D8 | Charge ready | PB0, from LT3751 `DONE`. Internal pull-up; unwired reads "ready" |
+| D2 | `HALL_TRIG` | INT0, falling edge, through an automotive Schmitt buffer |
+| D4 | `GATE_CMD` | PD4, 10 µs active-high into UCC27517A. **External 1k pulldown to GND** |
+| D7 | `MAP_SEL` | Internal pull-up. Open = Curve 1, grounded = Curve 2 |
+| D8 | `HV_READY` | PB0, from the TLV3012 comparator. Plain INPUT — external 100k pulldown (R44) |
+| D9 | `CHARGE_EN_RAW` | PB1, LOW disables the LT3751. **External pulldown required** |
+| A0 | `CHARGER_FAULT` | PC0, read as digital. LOW = LT3751 fault. External pull-up |
 
 ### Required external parts
 
@@ -64,32 +66,43 @@ rather than straight off a pin.
 
 | Block | Part | Key spec |
 |---|---|---|
-| Charger controller | **ADI LT3751** | Flyback capacitor charger, programmable to 500 V, `DONE` output |
-| Flyback transformer | 1:10, ≥20 W pulse rating | Per LT3751 datasheet table (Würth / Coilcraft matched parts) |
-| Primary switch | 150–200 V logic-level N-MOSFET | e.g. IRFB4615 — sees V<sub>in</sub> + V<sub>out</sub>/N ≈ 52 V plus leakage |
+| Charger controller | **ADI LT3751EFE#PBF** | Flyback capacitor charger in feedback regulation, 397–400 V |
+| Flyback transformer | **Coilcraft GA3459-BL** | 1:10, four primary windings paralleled |
+| Primary switch | **ST STP30NF20** | 200 V, with a 6 mΩ Kelvin current shunt (17.67 A limit) |
 | HV rectifier | **MUR1100E** | 1000 V, 1 A ultrafast |
-| Discharge capacitor | **5 × 0.22 µF / 1000 VDC MKP, paralleled** = 1.1 µF | WIMA MKP10 0.22 µF/1000 V — see below |
-| SCR | **ST TYN1225RG** | 25 A, 1200 V, I<sub>TSM</sub> 250 A, TO-220AB |
-| Gate driver | **TI UCC27517** + 1:1 pulse transformer | 4 A peak, 5 V logic input; isolates MCU from the 400 V stage |
-| Coil | **MSD 8223 Blaster HVC** | 0.7 Ω primary, specified by MSD for CD ignition systems |
-| Hall sensor | **Allegro A1101LUA** | Unipolar (non-latching) switch, open-drain, −40 to +150 °C |
+| Discharge capacitor | **5 × WIMA FKP 1, 0.22 µF / 1000 V** = 1.10 µF | Polypropylene pulse film |
+| SCR | **ST TYN1225RG** | 25 A, 1200 V, TO-220AB |
+| Gate driver | **TI UCC27517A-Q1** + **Coilcraft DA2099-AL** | Isolated pulse-transformer gate drive |
+| HV-ready comparator | **TI TLV3012** | Independent of the LT3751; 361.3 V rising, 357.6 V falling |
+| Coil | **MSD 8253 Blaster HVC-II** | External CD coil, ~3.5 mH primary |
+| Hall sensor | **Allegro A1101** | Unipolar (non-latching), filtered through a Schmitt buffer |
+| 5 V supply | **Murata OKI-78SR-5/1.5-W36-C** | Switching regulator into the Nano's 5V pin |
+
+Supply is restricted to a **4S LiFePO4 total-loss pack, 10.0–14.6 V**. Not for an
+alternator, stator-regulator, or any bus that can present a load dump.
 
 ### Why five capacitors instead of one
 
-The discharge is an LC ring, so peak dV/dt is V·ω, **not** V divided by rise time —
-the crude figure understates it by π/2:
+**Corrected against the measured coil.** An earlier revision of this document
+justified the five-way split with a peak current of 57 A and 54 V/µs, computed
+from an assumed **50 µH** coil primary. The MSD 8253's primary is **3.5 mH** —
+70× higher — so the real tank is far gentler:
 
-```
-ω = 1/√(LC) = 1.35e5 rad/s      dV/dt = 400 × ω = 53.9 V/µs
-```
+| | Assumed 50 µH | Actual 3.5 mH |
+|---|---|---|
+| Peak primary current | 59 A | **7.09 A** |
+| Rise time | 11.6 µs | **97.5 µs** |
+| Capacitor dV/dt | 53.9 V/µs | **6.45 V/µs** |
+| Current per capacitor | 11.9 A | **1.42 A** |
 
-A capacitor's dV/dt rating is really a peak-current rating in disguise
-(I = C·dV/dt), and the limit is current through the end-spray and electrode
-contacts. A single 1 µF part would have to carry the full **57 A**, which sits
-right at the edge of what a 1 µF MKP part will do. Five 0.22 µF parts see the
-same 54 V/µs but split the current **11.9 A each**, well inside the rating of
-small-value MKP — and paralleling drops ESL about fivefold, which sharpens the
-rise as a bonus. 1000 V parts on a 400 V rail is 2.5× derating.
+A single 1.1 µF part would carry 7 A at 6.5 V/µs, which is unremarkable for
+polypropylene film. **The five-way split is therefore not required by pulse
+current** — the original argument for it does not hold.
+
+It is kept anyway, for reasons that survive the correction: paralleling drops
+ESL and ESR roughly fivefold, spreads the ripple heating, and 0.22 µF / 1000 V
+FKP 1 parts are cheaper and physically easier to place in a tight discharge loop
+than one large part. 1000 V on a 400 V rail is 2.5× derating.
 
 Mount them as a tight cluster with short, wide copper to the SCR and coil; the
 loop area of the discharge path matters more than any single component here.
@@ -98,19 +111,29 @@ loop area of the discharge path matters more than any single component here.
 
 Driving the SCR gate directly from PD4 would have forced two constraints: the
 SCR cathode must sit at MCU ground (low-side only), and the device must be a
-sensitive-gate type whose I<sub>GT</sub> fits an AVR pin's ~20 mA budget. Those
-rule out any SCR with a serious dI/dt rating, which is the parameter that
-actually matters when 59 A appears in under 12 µs.
+sensitive-gate type whose I<sub>GT</sub> fits an AVR pin's ~20 mA budget.
 
-The UCC27517 into a 1:1 pulse transformer removes both constraints, delivers a
-fast, hard gate pulse, and keeps the MCU galvanically clear of the 400 V stage —
-the single biggest reliability risk in a system this electrically noisy.
+An earlier revision also justified this on dI/dt. **That argument does not
+survive the real coil** — with a 3.5 mH primary, max dI/dt is V/L = **0.11 A/µs**,
+which any thyristor handles without comment. (The assumed 50 µH would have given
+8 A/µs.) The SCR's dI/dt rating is simply not a binding constraint here.
 
-**This is why `GATE_PULSE_US` is 10, not 25.** The pulse transformer's
-volt-second product is the binding limit: 5 V × 10 µs = 50 V·µs, roughly half the
-specified part's rating. The SCR itself only needs 1–2 µs to turn on and then
-self-commutates below holding current, so 10 µs is already generous. **Raising it
-saturates the transformer.**
+The decision stands on the two reasons that do hold: it removes the low-side
+topology constraint, and it keeps the MCU galvanically clear of the 400 V stage
+— the single biggest reliability risk in a system this electrically noisy. The
+Rev A schematic drives the DA2099-AL from a UCC27517A-Q1 for exactly that reason.
+
+**This is why `GATE_PULSE_US` is 10, not 25.** The gate transformer's
+volt-second product is the binding limit. Worst case is at the top of the pack
+range, not at 5 V: **14.6 V × 10 µs = 146 V·µs** against the DA2099-AL's 221 V·µs
+rating. The SCR itself only needs 1–2 µs to turn on and then self-commutates
+below holding current, so 10 µs is already generous. **Raising it eats the
+remaining margin** — 15 µs at 14.6 V would be 219 V·µs, essentially at the limit.
+
+Volt-second arithmetic alone does not validate the gate stage. Capture U6 OUT,
+T2 primary current, and SCR gate-to-cathode voltage through *both* pulse edges,
+and confirm the falling edge resets the transformer without an unacceptable
+negative excursion.
 
 ### Energy and recharge budget
 
@@ -121,26 +144,40 @@ saturates the transformer.**
 | Charger output power | **16.1 W** |
 | Draw from 12 V at ~80% efficiency | **≈ 1.7 A** |
 | Time available between sparks | **5.45 ms** at 11,000 RPM, 9.23 ms at 6,500 |
-| Peak primary current | V·√(C/L) = **≈ 59 A** (11.9 A per capacitor) |
-| Peak dV/dt | V/√(LC) = **≈ 54 V/µs** |
-| Discharge rise time | (π/2)·√(LC) = **≈ 11.7 µs** |
-| Secondary output | 400 V × ~100:1 ≈ **40 kV** |
+| Peak primary current | V·√(C/L) = **7.09 A** (1.42 A per capacitor) |
+| Peak dV/dt | V/√(LC) = **6.45 V/µs** |
+| Discharge rise time | (π/2)·√(LC) = **97.5 µs** |
+| LT3751 current limit (6 mΩ shunt) | **17.67 A** |
 
 That 1.7 A is on top of the Nano and is the dominant load — size the pack wiring,
-fusing and the buck converter for it. Discharge takes ~12 µs against 5.45 ms
-between sparks at the limiter, a ~460× margin, so the ring is over long before
-the next revolution regardless of coil tolerance.
+fusing and the regulator for it. Discharge takes ~98 µs against 5.45 ms between
+sparks at the limiter, a **56× margin**, so the ring is long over before the next
+revolution.
 
-### Charge-ready interlock
+### Charge-ready and fault interface
 
-The LT3751's `DONE` output goes to **D8**, which is why this part was chosen over
-a generic UC3845 flyback: the interlock comes free with the controller.
+**`DONE` is not the charge-ready signal.** An earlier revision used the LT3751's
+`DONE` pin on D8. That was wrong: `DONE` reports that a charge *cycle* finished,
+which is not the same claim as the rail sitting at voltage. The schematic routes
+`DONE` to a test point as diagnostic only, and D8 instead comes from an
+independent **TLV3012** comparator on the HV divider — 361.3 V rising, 357.6 V
+falling.
 
-The firmware **fires regardless** of `DONE` — a weak spark beats a guaranteed
-misfire — but counts under-charged sparks, readable via `readWeakSparks()`. A
-count that climbs with revs means the charger is not keeping up with the rate
-being asked of it. Set `USE_CHARGE_READY` to 0 if the line is not wired; the pin
-uses the internal pull-up, so a disconnected input reads "ready" and stays quiet.
+The firmware **fires regardless** of D8 — a weak spark beats a guaranteed
+misfire — but counts under-charged sparks via `readWeakSparks()`. A count that
+climbs with revs means the charger is not keeping up.
+
+**D9 (`CHARGE_EN_RAW`)** holds the LT3751 off through reset and initialisation,
+and is raised only after the 5 V rail settles (20 ms) *and* A0 shows no fault.
+
+**A0 (`CHARGER_FAULT`)** is polled in `loop()`. On a fault the firmware drops D9,
+disarms any pending Timer1 compare, forces the gate command low, latches the
+condition, and suppresses sparks. Once A0 recovers it holds the charger off a
+further 10 ms before restarting regulation, so a chattering fault cannot
+free-run. Exposed via `readFaultCount()` and `chargerFaulted()`.
+
+An external charge-kill switch pulls `CHARGE_CTL` low directly and overrides D9.
+Battery disconnect remains the primary emergency stop.
 
 ### Why this coil
 
@@ -149,23 +186,20 @@ must be a capacitive-discharge type. Much of the inductive/Kettering range has a
 primary inductance one to two orders of magnitude too high, which stretches rise
 time and collapses peak current:
 
-| Primary inductance | Rise time (1.1 µF) | Peak primary current at 400 V |
-|---|---|---|
-| 50 µH (CD type) | ~12 µs | ~59 A |
-| 5 mH (inductive type) | ~117 µs | ~5.9 A |
+The **MSD 8253 Blaster HVC-II** is specified by MSD for capacitive-discharge
+boxes. Its ~3.5 mH primary sets the tank behaviour above.
 
-MSD specifies the Blaster HVC for its 6-series capacitive-discharge boxes and
-publishes a 0.7 Ω primary and ~40 kV output — 400 V against that output implies
-roughly a 100:1 turns ratio, so rail and coil are matched.
+Primary inductance is not a published catalogue figure, and this controller does
+not depend on knowing it: the firmware sets *when* the spark fires, not the
+discharge dynamics. That claim was worth making precisely because the assumption
+turned out to be **70× off** — 3.5 mH against an assumed 50 µH — and the timing
+conclusion still held, with the ring finishing 56× inside one revolution instead
+of the predicted 460×. What the wrong assumption *did* invalidate was the peak
+current and dV/dt figures, and the capacitor argument built on them (above).
 
-Primary inductance is not a published figure for any ignition coil, and it does
-not need to be for this controller: the firmware sets *when* the spark fires, not
-the discharge dynamics. A coil at the far end of tolerance shifts rise time and
-peak current but the spark still lands at the commanded crank angle, and even a
-10× inductance error leaves the ring finishing ~45× inside one revolution. The
-binding requirement is simply that the coil is manufacturer-stated for capacitive
-discharge — a coil sold for a points or transistorised system is not, whatever
-the brand on it.
+The binding requirement is simply that the coil is manufacturer-stated for
+capacitive discharge — a coil sold for a points or transistorised system is not,
+whatever the brand on it.
 
 ## Curves
 
@@ -242,7 +276,26 @@ avr-g++ -mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu++11 -Wall -Wextra \
   -x c++ ignition-controller.ino -c -o /tmp/out.o
 ```
 
+## Known blocker: trigger architecture
+
+> **Not engine-ready.** The one-pulse-per-revolution plausibility gate can still
+> accept some late EMI edges as genuine. Because a rejected edge does not commit
+> the reference timestamp, the measured interval keeps growing during a noise
+> burst until a spike eventually looks plausible — so the gate degrades against
+> *persistent* interference rather than holding the line. A single spike is
+> rejected cleanly and never skews the following measurement, which is the
+> common case, but that is not the same as being noise-proof.
+>
+> Do not run this on an engine until the trigger architecture is improved and
+> tested against real ignition noise. Bench and dummy-load testing is fine.
+
 ## Commissioning
+
+Follow the staged bring-up: 5 V regulator alone first, then signal circuitry
+(confirming D4 and D9 stay LOW through reset), then the charger without the SCR
+or coil on a current-limited supply, then the capacitor bank and HV-ready
+comparator, then the SCR into a dummy load, and only then the coil. Do not
+assemble the whole board and apply battery power.
 
 Every ignition build gets timed on the engine it runs on — `SENSOR_ANGLE` is a
 physical measurement of your trigger position, and no firmware can verify it.
@@ -253,10 +306,11 @@ physical measurement of your trigger position, and no firmware can verify it.
 3. **Put a timing light on it against a degree wheel** and check the fired angle
    matches the curve at idle and at a mid-range hold. If it reads consistently
    retarded at high RPM, raise `TRIGGER_LATENCY_US`.
-4. Read `readWeakSparks()` after a full-throttle run. Any climb with revs means
-   the charger is not keeping up.
+4. Read `readWeakSparks()` and `readFaultCount()` after a full-throttle run. Any
+   climb in weak sparks with revs means the charger is not keeping up.
 
-> **This drives a live ignition system at 400 V and ~40 kV.** Discharge the
+> **This drives a live ignition system at 400 V and tens of kV.** Discharge the
 > capacitor bank before touching the power stage — 88 mJ at 400 V is enough to
-> hurt, and the bank holds charge after the pack is disconnected. Bleed resistor
-> across the bank is cheap insurance.
+> hurt, and the bank holds charge after the pack is disconnected. The bleeder
+> takes about 10 s to fall from 400 V to 60 V; verify with a properly rated meter
+> rather than trusting the clock.

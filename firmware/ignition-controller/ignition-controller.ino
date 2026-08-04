@@ -16,10 +16,20 @@
  * rather than added to the delay as extra retard.
  * ------------------------------------------------------------------------- */
 
-const byte SENSOR_PIN       = 2;  // Hall sensor on INT0
-const byte SCR_PIN          = 4;  // Gate driver input (PD4) -> UCC27517 -> pulse transformer
-const byte MAP_SWITCH_PIN   = 7;  // Toggle switch (HIGH/open = Curve 1, LOW/closed = Curve 2)
-const byte CHARGE_READY_PIN = 8;  // PB0, from LT3751 DONE (high = capacitor at target voltage)
+/* Pin map per the Freedom CDI Rev A firmware interface contract. */
+const byte SENSOR_PIN       = 2;   // PD2, HALL_TRIG, INT0, falling edge
+const byte SCR_PIN          = 4;   // PD4, GATE_CMD -> UCC27517A -> DA2099-AL pulse transformer
+const byte MAP_SWITCH_PIN   = 7;   // PD7, MAP_SEL (HIGH/open = Curve 1, LOW = Curve 2)
+const byte CHARGE_READY_PIN = 8;   // PB0, HV_READY from the TLV3012 comparator
+const byte CHARGE_EN_PIN    = 9;   // PB1, CHARGE_EN_RAW (LOW disables the LT3751)
+const byte FAULT_PIN        = A0;  // PC0, CHARGER_FAULT (LOW = LT3751 fault)
+
+/* Startup and fault timing from the interface contract. D9 stays LOW through
+ * reset and init; the charger is only enabled once the 5 V rail has settled and
+ * the LT3751 is not reporting a fault. After a fault clears, D9 is held LOW for
+ * a further interval before restarting regulation. */
+const unsigned long POST_RESET_SETTLE_MS   = 20;
+const unsigned long FAULT_RECOVERY_HOLD_MS = 10;
 
 /* Gate pulse width. The SCR turns on in 1-2 us and self-commutates when the
  * discharge falls below holding current, so this only has to comfortably clear
@@ -28,14 +38,18 @@ const byte CHARGE_READY_PIN = 8;  // PB0, from LT3751 DONE (high = capacitor at 
  * raise it without checking the transformer will not saturate. */
 const unsigned int GATE_PULSE_US = 10;
 
-/* Charge-ready interlock. The LT3751 asserts DONE once the discharge capacitor
- * reaches its programmed voltage. If the charger has not finished by spark
- * time, we fire anyway -- a weak spark beats a guaranteed misfire -- but count
- * it, so an undersized charger shows up as a number instead of a vague
- * complaint about the engine going soft at high revs.
+/* Charge-ready interlock, from the independent TLV3012 HV comparator on D8
+ * (~361.3 V rising, ~357.6 V falling). Deliberately NOT the LT3751 DONE pin:
+ * DONE says a charge cycle finished, which is not the same claim as the rail
+ * actually sitting at voltage, so the schematic routes DONE to a test point as
+ * diagnostic only.
  *
- * Set to 0 if the DONE line is not wired. The pin uses the internal pull-up so
- * a disconnected input reads "ready" and stays quiet rather than counting noise. */
+ * D8 does not veto the spark -- a weak spark beats a guaranteed misfire -- but
+ * firing with D8 LOW is counted, so an undersized charger shows up as a number
+ * rather than a vague complaint about the engine going soft at high revs.
+ *
+ * The pin is a plain INPUT, not INPUT_PULLUP: HV_READY carries an external
+ * 100k pulldown (R44), which an internal pull-up would fight. */
 #define USE_CHARGE_READY 1
 
 const float SENSOR_ANGLE    = 35.0; // Physical sensor position (degrees BTDC)
@@ -149,6 +163,8 @@ volatile bool          rev_cut        = false;
 volatile uint8_t       noise_rejects  = 0;
 volatile uint8_t       active_curve   = 0;  // single byte: atomic against the ISR
 volatile unsigned int  weak_spark_count = 0;
+volatile bool          charger_fault  = false;
+volatile unsigned int  fault_count    = 0;
 
 // Linear Interpolation Math Function
 float calculateAdvance(unsigned int current_rpm, const TargetAdvance* activeMap) {
@@ -216,6 +232,10 @@ void sensorISR() {
 
   unsigned int rpm = (unsigned int)(60000000UL / interval);
   latest_rpm = rpm;
+
+  // Charger fault latched: keep measuring RPM for the dashboard, but do not
+  // schedule a spark until the fault clears and regulation restarts.
+  if (charger_fault) return;
 
   // Engine barely turning: no spark. This also keeps the tick math below within
   // 32 bits and within Timer1's 262 ms range.
@@ -296,17 +316,34 @@ unsigned int readWeakSparks() {
   return w;
 }
 
+// LT3751 fault events since boot, and whether one is currently latched.
+unsigned int readFaultCount() {
+  unsigned int f;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    f = fault_count;
+  }
+  return f;
+}
+
+bool chargerFaulted() {
+  return charger_fault;   // single byte: atomic on AVR
+}
+
 void setup() {
-  // Drive the SCR gate low before the pin becomes an output, so it cannot
-  // glitch high on the way. Note that the pin is high-Z during reset itself --
-  // an external pulldown on the gate is required, firmware cannot cover that.
+  // Both outputs must be LOW before they become outputs: the gate command so it
+  // cannot glitch the SCR, and the charger enable so the LT3751 stays shut down
+  // until initialisation finishes. Both pins are still high-Z during reset
+  // itself, which firmware cannot cover -- the external pulldowns do that.
   PORTD &= ~(1 << PORTD4);
+  PORTB &= ~(1 << PORTB1);
   pinMode(SCR_PIN, OUTPUT);
+  pinMode(CHARGE_EN_PIN, OUTPUT);
 
   pinMode(SENSOR_PIN, INPUT_PULLUP);
   pinMode(MAP_SWITCH_PIN, INPUT_PULLUP); // Uses internal pullup resistor
+  pinMode(FAULT_PIN, INPUT);             // external pull-up via R7/R8
 #if USE_CHARGE_READY
-  pinMode(CHARGE_READY_PIN, INPUT_PULLUP); // unwired reads "ready", stays quiet
+  pinMode(CHARGE_READY_PIN, INPUT);      // external 100k pulldown R44
 #endif
 
   buildDelayTable(0, curvePerformance);
@@ -318,6 +355,16 @@ void setup() {
   TCCR1B = T1_PRESCALER_BITS; // Prescaler 64, free-running
   TIMSK1 = 0;
 
+  // Let the 5 V rail settle before enabling regulation, then start the charger
+  // only if the LT3751 is not already asserting a fault.
+  delay(POST_RESET_SETTLE_MS);
+  if (PINC & (1 << PINC0)) {
+    PORTB |= (1 << PORTB1);   // CHARGE_EN_RAW high: enable regulation
+  } else {
+    charger_fault = true;     // latched; loop() runs the recovery sequence
+    fault_count++;
+  }
+
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensorISR, FALLING);
 
   wdt_enable(WDT_TIMEOUT);
@@ -325,6 +372,35 @@ void setup() {
 
 void loop() {
   wdt_reset(); // fed only from loop(), so a hung main path still resets
+
+  /* Charger fault handling. A0 LOW means the LT3751 is faulted: shut the
+   * charger down, drop any spark already armed, and force the gate command low.
+   * Once A0 recovers, hold the charger off a further FAULT_RECOVERY_HOLD_MS
+   * before restarting regulation, so a chattering fault cannot free-run. */
+  static bool hold_running = false;
+  static unsigned long hold_started_at = 0;
+
+  if (!(PINC & (1 << PINC0))) {            // fault asserted
+    if (!charger_fault) {
+      charger_fault = true;
+      fault_count++;
+    }
+    PORTB &= ~(1 << PORTB1);               // CHARGE_EN_RAW low
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      TIMSK1 &= ~(1 << OCIE1A);            // disarm a pending compare
+      PORTD &= ~(1 << PORTD4);             // gate command low
+    }
+    hold_running = false;
+  } else if (charger_fault) {              // fault gone, run the hold-off
+    if (!hold_running) {
+      hold_running = true;
+      hold_started_at = millis();
+    } else if (millis() - hold_started_at >= FAULT_RECOVERY_HOLD_MS) {
+      PORTB |= (1 << PORTB1);              // restart regulation
+      charger_fault = false;
+      hold_running = false;
+    }
+  }
 
   // Map switch is debounced out here rather than sampled inside the ISR, so a
   // bouncing contact cannot flip curves part-way through a revolution.
