@@ -276,18 +276,65 @@ avr-g++ -mmcu=atmega328p -DF_CPU=16000000UL -Os -std=gnu++11 -Wall -Wextra \
   -x c++ ignition-controller.ino -c -o /tmp/out.o
 ```
 
-## Known blocker: trigger architecture
+## Trigger noise: what is fixed, and what cannot be
 
-> **Not engine-ready.** The one-pulse-per-revolution plausibility gate can still
-> accept some late EMI edges as genuine. Because a rejected edge does not commit
-> the reference timestamp, the measured interval keeps growing during a noise
-> burst until a spike eventually looks plausible — so the gate degrades against
-> *persistent* interference rather than holding the line. A single spike is
-> rejected cleanly and never skews the following measurement, which is the
-> common case, but that is not the same as being noise-proof.
+Two defences were added against the noise weakness: **spark blanking** and a
+**tightened plausibility gate**. One further failure mode is not fixable in
+firmware at all, and it is important to know which is which.
+
+### Spark blanking (fixed)
+
+The dominant EMI source is the controller's own discharge. It is entirely
+predictable — the spark fires 11–34° after the trigger and the tank rings for
+~98 µs — so `SPARK_BLANK_US` (400 µs) discards every edge inside that window.
+
+Simulated with three spikes in each discharge ring over 400 revolutions:
+
+| RPM | Resyncs before | Resyncs after |
+|---|---|---|
+| 300 | 398 | **0** |
+| 600 | 398 | **0** |
+| 1200 | 398 | **0** |
+| 3000+ | 0 | 0 |
+
+At cranking and idle speeds the old gate was tearing down and re-establishing
+crank sync on *every revolution* — the region where stability matters most. Above
+~3000 RPM the 2700 µs debounce already covered it. Blanking can never mask a
+genuine edge: one is a full revolution away, and swallowing one would take about
+150,000 RPM.
+
+### Tightened plausibility gate (improved)
+
+The threshold moved from 1/2 to **3/4** of the previous interval, roughly
+doubling the rejection window for asynchronous spikes. It still allows a 33%
+speed gain per revolution against the 5–10% real engines manage. The cost shows
+only beyond ~40%/rev, where it resyncs rather than locking out.
+
+### Synchronous noise at a displaced phase (NOT fixable here)
+
+> A noise source firing **once per revolution at a fixed offset** — say 0.6 of
+> the way through the period — has *exactly the same period as the crank*. Once
+> such an edge is accepted it becomes the reference, and the genuine edge then
+> measures 0.4 of a period and is rejected as implausible. The spike train
+> captures sync and holds it.
 >
-> Do not run this on an engine until the trigger architecture is improved and
-> tested against real ignition noise. Bench and dummy-load testing is fine.
+> No interval-based filter can prevent this, tightened threshold or not. The two
+> trains are identical in period and differ only in phase, and **phase is
+> unobservable with one trigger per revolution.**
+
+The defences against it are not firmware:
+
+- The Rev A hardware filter — shielded Hall cable bonded at the enclosure, a
+  1 µs RC filter, and an automotive Schmitt buffer — which is why the schematic
+  has them.
+- Layout discipline: keep the Hall run away from the HT lead, the coil, and the
+  discharge loop.
+- If it still occurs, an **absolute phase reference** (multi-tooth or
+  missing-tooth wheel) is the real answer, and that is a hardware change beyond
+  this controller.
+
+**Bench and dummy-load testing is fine. Verify against real ignition noise with
+the sensor in its final routing before running an engine.**
 
 ## Commissioning
 

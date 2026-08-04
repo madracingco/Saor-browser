@@ -58,12 +58,26 @@ const float MIN_DELAY_ANGLE = 0.5;  // Never schedule closer than this to the se
 // Reject edges closer together than this (noise spikes above ~22,200 RPM).
 const unsigned long MIN_REV_DURATION_US = 2700UL;
 
-// Plausibility gate. The debounce above only catches spikes that land within
-// 2.7 ms of a genuine edge; ignition EMI arriving later than that would
-// otherwise be accepted as a real revolution. A single-cylinder engine cannot
-// come close to doubling its speed in one revolution, so an interval shorter
-// than half the previous one is noise. After this many consecutive rejections
-// we assume sync was genuinely lost rather than lock the spark out forever.
+/* Spark blanking. The dominant EMI source in a CDI is its own discharge, and it
+ * is entirely predictable: the spark fires 11-34 degrees after the trigger and
+ * the tank rings for ~98 us. Edges arriving inside that window are our own
+ * ignition event, never the crank.
+ *
+ * A genuine edge is one full revolution away, so this can never mask one: even
+ * at the 11,000 RPM limiter the next real edge is ~4.7 ms past the end of
+ * blanking, and swallowing a real edge would need ~150,000 RPM. */
+const unsigned long SPARK_BLANK_US = 400;
+
+/* Plausibility gate for EMI outside the blanking and debounce windows. Rejects
+ * an interval shorter than PLAUSIBLE_NUM/4 of the previous one.
+ *
+ * 3/4 allows the engine to gain 33% in one revolution; real single-cylinder
+ * engines manage 5-10%, so this is still generous. The earlier 1/2 threshold
+ * only caught spikes in the first half of the expected period and read anything
+ * landing at 60% as genuine.
+ *
+ * After this many consecutive rejections we assume sync was genuinely lost
+ * rather than lock the spark out forever. */
 const uint8_t MAX_CONSECUTIVE_REJECTS = 3;
 
 /* Fixed delay between the crank actually reaching SENSOR_ANGLE and this code
@@ -165,6 +179,8 @@ volatile uint8_t       active_curve   = 0;  // single byte: atomic against the I
 volatile unsigned int  weak_spark_count = 0;
 volatile bool          charger_fault  = false;
 volatile unsigned int  fault_count    = 0;
+volatile unsigned long blank_until    = 0;
+volatile unsigned int  blanked_count  = 0;
 
 // Linear Interpolation Math Function
 float calculateAdvance(unsigned int current_rpm, const TargetAdvance* activeMap) {
@@ -204,15 +220,23 @@ void sensorISR() {
   unsigned long now = micros();
   unsigned long interval = now - last_rev_time;
 
+  // Blanking: this edge is inside our own ignition event, not the crank.
+  // Signed compare so the micros() rollover at ~71 minutes is handled.
+  if ((long)(now - blank_until) < 0) {
+    blanked_count++;
+    return;
+  }
+
   // Debounce noise spikes. The reference timestamp is only committed once the
   // edge is known to be genuine, so a rejected spike cannot corrupt the next
   // interval measurement.
   if (interval < MIN_REV_DURATION_US) return;
 
-  // Plausibility gate for EMI landing outside the debounce window. Also
-  // rejected without committing the timestamp, so a spike cannot skew the
-  // next measurement either.
-  if (have_reference && last_interval != 0 && interval < (last_interval >> 1)) {
+  // Plausibility gate for EMI landing outside the blanking and debounce
+  // windows. Also rejected without committing the timestamp, so a spike cannot
+  // skew the next measurement either.
+  if (have_reference && last_interval != 0 &&
+      interval < (last_interval - (last_interval >> 2))) {   // < 3/4 of previous
     if (++noise_rejects < MAX_CONSECUTIVE_REJECTS) return;
     have_reference = false;   // persistent mismatch: resync rather than lock out
   }
@@ -295,6 +319,9 @@ ISR(TIMER1_COMPA_vect) {
   PORTD |= (1 << PORTD4);            // Gate driver input high
   delayMicroseconds(GATE_PULSE_US);  // Clear the SCR's turn-on delay
   PORTD &= ~(1 << PORTD4);           // Gate driver input low
+
+  // Ignore crank edges until our own discharge has finished ringing.
+  blank_until = micros() + SPARK_BLANK_US;
 }
 
 // Safe accessors for external dashboards / shift lights.
@@ -327,6 +354,16 @@ unsigned int readFaultCount() {
 
 bool chargerFaulted() {
   return charger_fault;   // single byte: atomic on AVR
+}
+
+// Edges discarded because they fell inside our own spark event. A steady count
+// of roughly one per spark is normal and means blanking is doing its job.
+unsigned int readBlankedEdges() {
+  unsigned int b;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    b = blanked_count;
+  }
+  return b;
 }
 
 void setup() {
